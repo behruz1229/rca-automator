@@ -333,7 +333,7 @@ func main() {
 	time.Sleep(300 * time.Millisecond)
 	dropdownTarget.MustClick()
 
-	log.Println("   -> Ожидание открытия списка (1.5 сек)...")
+	log.Println("   -> Ожидание открытия списка (4 сек)...")
 	time.Sleep(4000 * time.Millisecond)
 
 	log.Println("🎯 Выбираем 'RFI (строительный контроль)'...")

@@ -1,3 +1,0 @@
-login=ВАШ_ЛОГИН
-password=ВАШ_ПАРОЛЬ
-network_path=\\server\share\путь\до\папки\Выгрузки
