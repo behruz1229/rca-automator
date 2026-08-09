@@ -6,4 +6,4 @@ debug.log
 *.png
 
 # Скомпилированный исполняемый файл
-RCA_Auto.exe
+*.exe

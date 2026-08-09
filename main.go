@@ -81,6 +81,28 @@ func cleanOldScreenshots(dir string) {
 	}
 }
 
+// cleanRodTempDirs удаляет старые случайные папки профиля go-rod в Temp\rod\user-data
+// (только папки от завершённых запусков — занятые работающим браузером Windows не удалит)
+func cleanRodTempDirs() {
+	rodTemp := filepath.Join(os.TempDir(), "rod", "user-data")
+	entries, err := os.ReadDir(rodTemp)
+	if err != nil {
+		return // папки нет — чистить нечего
+	}
+	removed := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(rodTemp, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("🧹 Удалено старых папок go-rod в Temp: %d", removed)
+	}
+}
+
 // saveErrorScreenshot сохраняет скриншот ТОЛЬКО при ошибке
 func saveErrorScreenshot(page *rod.Page, stepName string) {
 	if page == nil {
@@ -216,6 +238,23 @@ func main() {
 
 	log.Println("🚀 Запуск автоматизации RCA...")
 
+	// === УНИКАЛЬНАЯ ПАПКА ПРОФИЛЯ БРАУЗЕРА НА ОСНОВЕ ИМЕНИ EXE ===
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Fatalf("❌ Не удалось определить путь к exe-файлу: %v", err)
+	}
+	exeName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath))
+	profileDir := filepath.Join(os.TempDir(), "rca-rod-"+exeName)
+	log.Printf("📁 Папка профиля браузера: %s", profileDir)
+
+	// Удаляем папку профиля, если она осталась от прошлого аварийного запуска
+	if err := os.RemoveAll(profileDir); err != nil {
+		log.Printf("⚠️ Не удалось удалить старую папку профиля: %v", err)
+	}
+
+	// Разовая очистка накопившегося мусора go-rod в Temp\rod\user-data
+	cleanRodTempDirs()
+
 	// Автоудаление старых скриншотов при старте
 	cleanOldScreenshots(absCwd)
 
@@ -225,6 +264,14 @@ func main() {
 		if r := recover(); r != nil {
 			log.Printf("❌ СКРИПТ ОСТАНОВИЛСЯ С ОШИБКОЙ: %v", r)
 			saveErrorScreenshot(page, "crash")
+		}
+		// Удаляем папку профиля после завершения работы браузера
+		if profileDir != "" {
+			if err := os.RemoveAll(profileDir); err != nil {
+				log.Printf("⚠️ Не удалось удалить папку профиля: %v", err)
+			} else {
+				log.Println("🧹 Папка профиля браузера удалена")
+			}
 		}
 		if logFile != nil {
 			logFile.Close()
@@ -250,6 +297,7 @@ func main() {
 
 	l := launcher.New().
 		Bin(browserPath).
+		UserDataDir(profileDir). // Фиксированная уникальная папка профиля
 		Set("download.default_directory", filepath.ToSlash(downloadDir)).
 		Set("download.prompt_for_download", "false").
 		Set("safebrowsing.enabled", "false").
@@ -334,7 +382,7 @@ func main() {
 	dropdownTarget.MustClick()
 
 	log.Println("   -> Ожидание открытия списка (4 сек)...")
-	time.Sleep(4000 * time.Millisecond)
+	time.Sleep(4 * time.Second)
 
 	log.Println("🎯 Выбираем 'RFI (строительный контроль)'...")
 	rfiSelected := false
