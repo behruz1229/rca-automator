@@ -1,19 +1,475 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
-	"io"
+	"image"
+	"image/png"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"golang.org/x/image/draw"
+
 	"github.com/go-rod/rod"
-	"github.com/go-rod/rod/lib/input"
-	"github.com/go-rod/rod/lib/launcher"
-	"github.com/go-rod/rod/lib/proto"
+	"github.com/lxn/walk"
+	. "github.com/lxn/walk/declarative"
 )
+
+//go:embed icon.ico
+var iconData []byte
+
+var appIcon *walk.Icon
+
+// initAppIcon извлекает встроенную иконку и загружает её для окон программы
+func initAppIcon() {
+	tmp := filepath.Join(os.TempDir(), "rca-app-icon.ico")
+	if err := os.WriteFile(tmp, iconData, 0644); err != nil {
+		return
+	}
+	if ico, err := walk.NewIconFromFile(tmp); err == nil {
+		appIcon = ico
+	}
+}
+
+// === GUI: глобальные переменные главного окна ===
+var (
+	mw          *walk.MainWindow
+	logoView    *walk.ImageView
+	settingsBtn *walk.PushButton
+
+	rfiCheck    *walk.CheckBox
+	rfiCheckLbl *walk.Label
+	idCheck     *walk.CheckBox
+	idCheckLbl  *walk.Label
+
+	rfiRowLbl *walk.Label
+	rfiBar    *walk.ProgressBar
+	rfiPct    *walk.Label
+	rfiStat   *walk.Label
+	rfiFold   *walk.PushButton
+
+	idRowLbl *walk.Label
+	idBar    *walk.ProgressBar
+	idPct    *walk.Label
+	idStat   *walk.Label
+	idFold   *walk.PushButton
+
+	startBtn  *walk.PushButton
+	cancelBtn *walk.PushButton
+	closeBtn  *walk.PushButton
+
+	isDark   bool
+	guiAlive int32
+)
+
+var statusChannel = make(chan StatusMessage, 100)
+
+type StatusMessage struct {
+	Task         string
+	Text         string
+	Progress     int
+	IsError      bool
+	IsFinal      bool
+	OpenSettings bool
+}
+
+var (
+	globalBrowser *rod.Browser
+	appConfig     *Config
+	configPath    string
+	exeDirPath    string
+
+	taskMu      sync.Mutex
+	currentTask = "RFI"
+)
+
+func setTask(t string) {
+	taskMu.Lock()
+	currentTask = t
+	taskMu.Unlock()
+}
+
+func getTask() string {
+	taskMu.Lock()
+	defer taskMu.Unlock()
+	return currentTask
+}
+
+func updateStatus(text string, progress int) {
+	select {
+	case statusChannel <- StatusMessage{Task: getTask(), Text: text, Progress: progress}:
+	default:
+	}
+}
+
+func updateStatusError(text string) {
+	select {
+	case statusChannel <- StatusMessage{Task: getTask(), Text: text, IsError: true}:
+	default:
+	}
+}
+
+func updateStatusFinal(text string) {
+	select {
+	case statusChannel <- StatusMessage{Task: getTask(), Text: text, IsFinal: true}:
+	default:
+	}
+}
+
+func requestOpenSettings() {
+	select {
+	case statusChannel <- StatusMessage{OpenSettings: true}:
+	default:
+	}
+}
+
+// loadLogo подгружает логотип под текущую тему и масштабирует его,
+// чтобы он полностью помещался в окне (300x80) с сохранением пропорций.
+// Файлы: icon_dark.png (тёмная тема), icon_light.png (светлая), icon.png — запасной.
+func loadLogo() {
+	name := "icon_light.png"
+	if isDark {
+		name = "icon_dark.png"
+	}
+	path := filepath.Join(exeDirPath, name)
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join(exeDirPath, "icon.png")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		logoView.SetVisible(false)
+		return
+	}
+	img, err := png.Decode(f)
+	f.Close()
+	if err != nil {
+		logoView.SetVisible(false)
+		return
+	}
+
+	// Вписываем в 300x80 с сохранением пропорций
+	maxW, maxH := 300, 80
+	bounds := img.Bounds()
+	bw, bh := bounds.Dx(), bounds.Dy()
+	if bw == 0 || bh == 0 {
+		logoView.SetVisible(false)
+		return
+	}
+	scale := float64(maxW) / float64(bw)
+	if float64(bh)*scale > float64(maxH) {
+		scale = float64(maxH) / float64(bh)
+	}
+	targetW := int(float64(bw) * scale)
+	targetH := int(float64(bh) * scale)
+	if targetW < 1 || targetH < 1 {
+		logoView.SetVisible(false)
+		return
+	}
+
+	resized := image.NewRGBA(image.Rect(0, 0, targetW, targetH))
+	draw.BiLinear.Scale(resized, resized.Bounds(), img, bounds, draw.Over, nil)
+
+	tmpPath := filepath.Join(os.TempDir(), "rca-logo-current.png")
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		logoView.SetVisible(false)
+		return
+	}
+	png.Encode(out, resized)
+	out.Close()
+
+	if bmp, err := walk.NewBitmapFromFile(tmpPath); err == nil {
+		logoView.SetImage(bmp)
+		logoView.SetVisible(true)
+	} else {
+		logoView.SetVisible(false)
+	}
+}
+
+// runSelectedTasks выполняет выбранные выгрузки последовательно
+func runSelectedTasks() {
+	defer func() {
+		// После завершения возвращаем управление пользователю
+		mw.Synchronize(func() {
+			startBtn.SetEnabled(true)
+			rfiCheck.SetEnabled(true)
+			idCheck.SetEnabled(true)
+		})
+	}()
+
+	allOK := true
+
+	if rfiCheck.Checked() {
+		setTask("RFI")
+		if !runRFIAutomation() {
+			allOK = false
+		}
+	}
+
+	if idCheck.Checked() {
+		setTask("ID")
+		if !runIDAutomation() {
+			allOK = false
+		}
+	}
+
+	if allOK {
+		updateStatusFinal("🎉 Все выбранные выгрузки завершены!")
+	} else {
+		updateStatus("⚠️ Завершено с ошибками — проверьте статусы задач", 0)
+	}
+}
+
+// applyTheme применяет светлую или тёмную тему ко всем текстам окна,
+// обновляет кнопки папок и перезагружает логотип под тему
+func applyTheme() {
+	var bg, fg walk.Color
+	if isDark {
+		bg = walk.RGB(38, 38, 42)
+		fg = walk.RGB(240, 240, 240)
+	} else {
+		bg = walk.RGB(250, 250, 250)
+		fg = walk.RGB(35, 35, 35)
+	}
+	if brush, err := walk.NewSolidColorBrush(bg); err == nil {
+		mw.SetBackground(brush)
+	}
+	rfiStat.SetTextColor(fg)
+	idStat.SetTextColor(fg)
+	rfiPct.SetTextColor(fg)
+	idPct.SetTextColor(fg)
+	rfiRowLbl.SetTextColor(fg)
+	idRowLbl.SetTextColor(fg)
+	rfiCheckLbl.SetTextColor(fg)
+	idCheckLbl.SetTextColor(fg)
+
+	// Кнопки папок активны, если папка указана в настройках
+	rfiFold.SetEnabled(strings.TrimSpace(appConfig.RFIPath) != "")
+	idFold.SetEnabled(strings.TrimSpace(appConfig.IDPath) != "")
+
+	// Логотип под тему
+	loadLogo()
+}
+
+// cancelRun отменяет выполнение и завершает программу
+func cancelRun() {
+	log.Println("🛑 Выполнение отменено пользователем")
+	if globalBrowser != nil {
+		globalBrowser.Close()
+	}
+	os.Exit(0)
+}
+
+// startMainWindow создаёт и запускает главное окно программы
+func startMainWindow(exeDir, exeName string) {
+	windowTitle := strings.ReplaceAll(exeName, "_", " ")
+
+	last := appConfig.LastTasks
+	rfiDefault := last == "" || strings.Contains(last, "RFI")
+	idDefault := strings.Contains(last, "ID")
+
+	err := MainWindow{
+		AssignTo: &mw,
+		Title:    windowTitle,
+		Size:     Size{550, 400},
+		MinSize:  Size{550, 400},
+		Layout:   VBox{},
+		Children: []Widget{
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{
+						AssignTo: &settingsBtn,
+						Text:     "⚙",
+						MaxSize:  Size{44, 32},
+						OnClicked: func() {
+							openSettingsAndMaybeStart()
+						},
+					},
+				},
+			},
+			ImageView{
+				AssignTo: &logoView,
+				MinSize:  Size{300, 80},
+				MaxSize:  Size{300, 80},
+			},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					HSpacer{},
+					CheckBox{AssignTo: &rfiCheck, Checked: rfiDefault},
+					Label{AssignTo: &rfiCheckLbl, Text: "RFI (инспекции)"},
+					HSpacer{},
+					CheckBox{AssignTo: &idCheck, Checked: idDefault},
+					Label{AssignTo: &idCheckLbl, Text: "ИД (исполнительная документация)"},
+					HSpacer{},
+				},
+			},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					Label{AssignTo: &rfiRowLbl, Text: "RFI", MinSize: Size{40, 0}},
+					ProgressBar{AssignTo: &rfiBar, MinSize: Size{300, 12}, MaxSize: Size{1000, 12}},
+					Label{AssignTo: &rfiPct, Text: "0%", MinSize: Size{50, 0}},
+					PushButton{
+						AssignTo:  &rfiFold,
+						Text:      "📁",
+						MaxSize:   Size{44, 30},
+						Enabled:   false,
+						OnClicked: func() { openFolder(appConfig.RFIPath) },
+					},
+				},
+			},
+			Label{
+				AssignTo:  &rfiStat,
+				Text:      "Ожидание запуска...",
+				Alignment: AlignHCenterVCenter,
+				MinSize:   Size{0, 30},
+			},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					Label{AssignTo: &idRowLbl, Text: "ИД ", MinSize: Size{40, 0}},
+					ProgressBar{AssignTo: &idBar, MinSize: Size{300, 12}, MaxSize: Size{1000, 12}},
+					Label{AssignTo: &idPct, Text: "0%", MinSize: Size{50, 0}},
+					PushButton{
+						AssignTo:  &idFold,
+						Text:      "📁",
+						MaxSize:   Size{44, 30},
+						Enabled:   false,
+						OnClicked: func() { openFolder(appConfig.IDPath) },
+					},
+				},
+			},
+			Label{
+				AssignTo:  &idStat,
+				Text:      "Ожидание запуска...",
+				Alignment: AlignHCenterVCenter,
+				MinSize:   Size{0, 30},
+			},
+			Composite{
+				Layout: HBox{},
+				Children: []Widget{
+					HSpacer{},
+					PushButton{
+						AssignTo: &startBtn,
+						Text:     "Старт",
+						MinSize:  Size{120, 36},
+						OnClicked: func() {
+							tasks := ""
+							if rfiCheck.Checked() {
+								tasks = "RFI"
+							}
+							if idCheck.Checked() {
+								if tasks != "" {
+									tasks += ","
+								}
+								tasks += "ID"
+							}
+							if tasks == "" {
+								return
+							}
+							appConfig.LastTasks = tasks
+							SaveConfig(configPath, appConfig)
+
+							startBtn.SetEnabled(false)
+							rfiCheck.SetEnabled(false)
+							idCheck.SetEnabled(false)
+
+							rfiBar.SetValue(0)
+							rfiPct.SetText("0%")
+							rfiStat.SetText("Ожидание запуска...")
+							idBar.SetValue(0)
+							idPct.SetText("0%")
+							idStat.SetText("Ожидание запуска...")
+
+							go runSelectedTasks()
+						},
+					},
+					HSpacer{},
+					PushButton{
+						AssignTo:  &cancelBtn,
+						Text:      "Отмена",
+						MinSize:   Size{120, 36},
+						OnClicked: cancelRun,
+					},
+					HSpacer{},
+					PushButton{
+						AssignTo:  &closeBtn,
+						Text:      "Закрыть",
+						MinSize:   Size{120, 36},
+						OnClicked: func() { mw.Close() },
+					},
+					HSpacer{},
+				},
+			},
+		},
+	}.Create()
+
+	if err != nil {
+		log.Printf("⚠️ Не удалось создать окно: %v", err)
+		return
+	}
+
+	if appIcon != nil {
+		mw.SetIcon(appIcon)
+	}
+
+	applyTheme()
+
+	go func() {
+		for msg := range statusChannel {
+			m := msg
+			if atomic.LoadInt32(&guiAlive) == 0 {
+				continue
+			}
+			if m.OpenSettings {
+				mw.Synchronize(openSettingsAndMaybeStart)
+				continue
+			}
+			mw.Synchronize(func() {
+				var stat *walk.Label
+				var bar *walk.ProgressBar
+				var pct *walk.Label
+				var fold *walk.PushButton
+
+				if m.Task == "ID" {
+					stat, bar, pct, fold = idStat, idBar, idPct, idFold
+				} else {
+					stat, bar, pct, fold = rfiStat, rfiBar, rfiPct, rfiFold
+				}
+
+				if m.Text != "" {
+					stat.SetText(m.Text)
+				}
+				if m.Progress > 0 {
+					bar.SetValue(m.Progress)
+					pct.SetText(fmt.Sprintf("%d%%", m.Progress))
+				}
+				if m.Progress == 100 && !m.IsError {
+					fold.SetEnabled(true)
+				}
+				if m.IsFinal {
+					cancelBtn.SetEnabled(false)
+					time.AfterFunc(5*time.Second, func() {
+						mw.Synchronize(func() { mw.Close() })
+					})
+				}
+			})
+		}
+	}()
+
+	atomic.StoreInt32(&guiAlive, 1)
+	mw.Run()
+	atomic.StoreInt32(&guiAlive, 0)
+}
 
 func findBrowser() string {
 	paths := []string{
@@ -33,487 +489,60 @@ func findBrowser() string {
 	return "chrome"
 }
 
-// readConfig читает логин, пароль и сетевой путь из config.txt
-func readConfig() (string, string, string, error) {
-	data, err := os.ReadFile("config.txt")
-	if err != nil {
-		return "", "", "", fmt.Errorf("не удалось прочитать config.txt: %v", err)
-	}
-
-	var login, password, networkPath string
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "login=") {
-			login = strings.TrimPrefix(line, "login=")
-		} else if strings.HasPrefix(line, "password=") {
-			password = strings.TrimPrefix(line, "password=")
-		} else if strings.HasPrefix(line, "network_path=") {
-			networkPath = strings.TrimPrefix(line, "network_path=")
-		}
-	}
-
-	if login == "" || password == "" {
-		return "", "", "", fmt.Errorf("логин или пароль не найдены в config.txt")
-	}
-	if networkPath == "" {
-		return "", "", "", fmt.Errorf("network_path не найден в config.txt")
-	}
-	return login, password, networkPath, nil
-}
-
-// cleanOldScreenshots удаляет старые скриншоты при старте скрипта
-func cleanOldScreenshots(dir string) {
-	removed := 0
-	for _, pattern := range []string{"step_*.png", "error_*.png"} {
-		matches, err := filepath.Glob(filepath.Join(dir, pattern))
-		if err != nil {
-			continue
-		}
-		for _, file := range matches {
-			if err := os.Remove(file); err == nil {
-				removed++
-			}
-		}
-	}
-	if removed > 0 {
-		log.Printf("🧹 Удалено старых скриншотов: %d", removed)
-	}
-}
-
-// cleanRodTempDirs удаляет старые случайные папки профиля go-rod в Temp\rod\user-data
-// (только папки от завершённых запусков — занятые работающим браузером Windows не удалит)
-func cleanRodTempDirs() {
-	rodTemp := filepath.Join(os.TempDir(), "rod", "user-data")
-	entries, err := os.ReadDir(rodTemp)
-	if err != nil {
-		return // папки нет — чистить нечего
-	}
-	removed := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		if err := os.RemoveAll(filepath.Join(rodTemp, entry.Name())); err == nil {
-			removed++
-		}
-	}
-	if removed > 0 {
-		log.Printf("🧹 Удалено старых папок go-rod в Temp: %d", removed)
-	}
-}
-
-// saveErrorScreenshot сохраняет скриншот ТОЛЬКО при ошибке
-func saveErrorScreenshot(page *rod.Page, stepName string) {
-	if page == nil {
-		return
-	}
-	cwd, _ := os.Getwd()
-	if cwd == "" {
-		cwd = "."
-	}
-	path := filepath.Join(cwd, fmt.Sprintf("error_%s.png", stepName))
-	imgBytes, err := page.Screenshot(false, nil)
-	if err != nil {
-		log.Printf("⚠️ Не удалось сделать скриншот ошибки: %v", err)
-		return
-	}
-	if err := os.WriteFile(path, imgBytes, 0644); err != nil {
-		log.Printf("⚠️ Не удалось сохранить скриншот ошибки: %v", err)
-		return
-	}
-	log.Printf("📸 Скриншот ошибки сохранен: %s", path)
-}
-
-func sendKeyThroughCDP(page *rod.Page, key string, eventType proto.InputDispatchKeyEventType) error {
-	return proto.InputDispatchKeyEvent{
-		Type:                  eventType,
-		Key:                   key,
-		Code:                  key,
-		WindowsVirtualKeyCode: 13,
-		NativeVirtualKeyCode:  13,
-	}.Call(page)
-}
-
-// waitForDownload ищет самый свежий файл по маске в папке
-func waitForDownload(dir string, pattern string, timeout time.Duration) string {
-	startTime := time.Now()
-	log.Printf("🔍 Начинаю мониторинг папки: %s", dir)
-	log.Printf("🔍 Ищу файлы по маске: %s", pattern)
-
-	for {
-		if time.Since(startTime) > timeout {
-			log.Printf("⏰ Время ожидания истекло (%v)", timeout)
-			return ""
-		}
-
-		matches, err := filepath.Glob(filepath.Join(dir, pattern))
-		if err == nil && len(matches) > 0 {
-			var newestFile string
-			var newestTime time.Time
-
-			for _, match := range matches {
-				if strings.HasSuffix(match, ".crdownload") {
-					continue
-				}
-
-				info, err := os.Stat(match)
-				if err != nil {
-					continue
-				}
-
-				if newestFile == "" || info.ModTime().After(newestTime) {
-					newestFile = match
-					newestTime = info.ModTime()
-				}
-			}
-
-			if newestFile != "" {
-				log.Printf("✅ Найден свежий файл: %s", newestFile)
-				return newestFile
-			}
-		}
-
-		time.Sleep(1 * time.Second)
-	}
-}
-
-// cleanOldFiles удаляет старые файлы выгрузки в сетевой папке по маске
-func cleanOldFiles(dir string, pattern string) {
-	matches, err := filepath.Glob(filepath.Join(dir, pattern))
-	if err != nil {
-		log.Printf("⚠️ Ошибка поиска старых файлов по маске '%s': %v", pattern, err)
-		return
-	}
-
-	if len(matches) == 0 {
-		log.Println("   -> Старых файлов для удаления не найдено")
-		return
-	}
-
-	for _, file := range matches {
-		log.Printf("🗑️ Удаляем старый файл: %s", filepath.Base(file))
-		if err := os.Remove(file); err != nil {
-			log.Printf("⚠️ Не удалось удалить файл %s: %v", file, err)
-		}
-	}
-}
-
-// copyFile копирует файл из src в dst
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return fmt.Errorf("не удалось открыть исходный файл: %v", err)
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return fmt.Errorf("не удалось создать файл назначения: %v", err)
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		return fmt.Errorf("ошибка копирования данных: %v", err)
-	}
-
-	return destFile.Sync()
-}
-
 func main() {
 	absCwd, err := filepath.Abs(".")
 	if err != nil {
 		log.Fatalf("❌ Не удалось получить абсолютный путь: %v", err)
 	}
 
-	// Лог очищается при каждом запуске
-	logFilePath := filepath.Join(absCwd, "debug.log")
-	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err == nil {
-		multiWriter := io.MultiWriter(os.Stdout, logFile)
-		log.SetOutput(multiWriter)
-	} else {
-		log.Println("⚠️ Не удалось создать debug.log, пишем только в консоль")
-	}
-
-	log.Println("🚀 Запуск автоматизации RCA...")
-
-	// === УНИКАЛЬНАЯ ПАПКА ПРОФИЛЯ БРАУЗЕРА НА ОСНОВЕ ИМЕНИ EXE ===
 	exePath, err := os.Executable()
 	if err != nil {
 		log.Fatalf("❌ Не удалось определить путь к exe-файлу: %v", err)
 	}
 	exeName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath))
-	profileDir := filepath.Join(os.TempDir(), "rca-rod-"+exeName)
-	log.Printf("📁 Папка профиля браузера: %s", profileDir)
+	exeDir := filepath.Dir(exePath)
+	exeDirPath = exeDir
 
-	// Удаляем папку профиля, если она осталась от прошлого аварийного запуска
-	if err := os.RemoveAll(profileDir); err != nil {
-		log.Printf("⚠️ Не удалось удалить старую папку профиля: %v", err)
+	initAppIcon()
+
+	// === ЗАЩИТА ОТ ВТОРОГО ЗАПУСКА ===
+	inst := acquireSingleInstance(exeName + "_SingleInstance")
+	if inst == nil {
+		msgBox("RCA Automator", "Программа уже запущена.", mbIconInfo)
+		return
 	}
 
-	// Разовая очистка накопившегося мусора go-rod в Temp\rod\user-data
-	cleanRodTempDirs()
-
-	// Автоудаление старых скриншотов при старте
-	cleanOldScreenshots(absCwd)
-
-	var page *rod.Page
-
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("❌ СКРИПТ ОСТАНОВИЛСЯ С ОШИБКОЙ: %v", r)
-			saveErrorScreenshot(page, "crash")
-		}
-		// Удаляем папку профиля после завершения работы браузера
-		if profileDir != "" {
-			if err := os.RemoveAll(profileDir); err != nil {
-				log.Printf("⚠️ Не удалось удалить папку профиля: %v", err)
-			} else {
-				log.Println("🧹 Папка профиля браузера удалена")
-			}
-		}
-		if logFile != nil {
-			logFile.Close()
-		}
-	}()
-
-	// Читаем логин, пароль и сетевой путь из config.txt
-	login, password, networkSharePath, err := readConfig()
+	// === ЛОГИ ===
+	logFile, err := setupLogging(absCwd)
 	if err != nil {
-		log.Fatalf("❌ Ошибка конфигурации: %v", err)
+		log.Println("⚠️ Не удалось создать лог-файл, пишем только в консоль")
 	}
-	log.Printf("📂 Сетевая папка для выгрузок: %s", networkSharePath)
 
-	homeDir, _ := os.UserHomeDir()
-	downloadDir := filepath.Join(homeDir, "Downloads")
-	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
-		downloadDir = filepath.Join(homeDir, "Загрузки")
-	}
-	log.Printf("📂 Отслеживаем папку загрузок: %s", downloadDir)
-
-	browserPath := findBrowser()
-	log.Printf("🌐 Используем браузер: %s", browserPath)
-
-	l := launcher.New().
-		Bin(browserPath).
-		UserDataDir(profileDir). // Фиксированная уникальная папка профиля
-		Set("download.default_directory", filepath.ToSlash(downloadDir)).
-		Set("download.prompt_for_download", "false").
-		Set("safebrowsing.enabled", "false").
-		Headless(true). // ФОНОВЫЙ РЕЖИМ: окно браузера не показывается
-		// Если понадобится снова увидеть окно браузера:
-		// закомментируйте Headless(true) выше и раскомментируйте Headless(false) ниже:
-		// Headless(false).
-		Devtools(false)
-
-	url, err := l.Launch()
+	// === ЧТЕНИЕ КОНФИГА ===
+	configPath = filepath.Join(absCwd, "config.txt")
+	cfg, err := LoadConfig(configPath)
 	if err != nil {
-		log.Fatalf("❌ Не удалось запустить браузер: %v", err)
+		log.Printf("⚠️ config.txt не найден или не читается: %v", err)
+		cfg = &Config{}
 	}
+	appConfig = cfg
+	isDark = cfg.Theme == "dark"
 
-	browser := rod.New().ControlURL(url).MustConnect()
-	defer browser.MustClose()
-
-	page = browser.MustPage()
-
-	// 1. Настройка экрана
-	log.Println("📐 Устанавливаем viewport 1920x1080...")
-	page.MustSetViewport(1920, 1080, 1, false)
-	time.Sleep(500 * time.Millisecond)
-
-	// 2. Вход в систему
-	log.Println("🔑 Выполняем вход...")
-	page.MustNavigate("https://rca.sgaz.pro/")
-	page.MustWaitLoad()
-
-	page.MustElement("#loginInput").MustWaitVisible().MustInput(login)
-	page.MustElement("#passInput").MustWaitVisible().MustInput(password)
-
-	if err := page.Keyboard.Press(input.Enter); err != nil {
-		saveErrorScreenshot(page, "login_enter")
-		log.Fatalf("❌ Ошибка нажатия Enter после пароля: %v", err)
-	}
-
-	time.Sleep(4 * time.Second)
-
-	// 3. Переход к задачам
-	log.Println("📂 Переход к задачам...")
-	page.MustNavigate("https://rca.sgaz.pro/faces/page/contracts/52931/build-tracker/tasks")
-
-	log.Println("   -> Ожидание отрисовки кнопки фильтров...")
-	filterBtn := page.MustElement("#gw9gh4_9").MustWaitVisible()
-
-	// 4. Открытие фильтра
-	log.Println("🔽 Открываем фильтры...")
-	filterBtn.MustClick()
-
-	log.Println("   -> Ожидание открытия диалога...")
-	filterInput := page.MustElement("#gihyoe-suggest-input").MustWaitVisible()
-	time.Sleep(500 * time.Millisecond)
-
-	// 5. Применение фильтра "км"
-	log.Println("⌨️ Применяем фильтр 'км'...")
-	filterInput.MustClick()
-	time.Sleep(300 * time.Millisecond)
-	filterInput.MustInput("км")
-
-	time.Sleep(2 * time.Second)
-
-	log.Println("   -> Отправка Enter через CDP...")
-	sendKeyThroughCDP(page, "Enter", proto.InputDispatchKeyEventTypeKeyDown)
-	time.Sleep(100 * time.Millisecond)
-	sendKeyThroughCDP(page, "Enter", proto.InputDispatchKeyEventTypeKeyUp)
-
-	time.Sleep(2 * time.Second)
-
-	// 6. Нажатие OK
-	log.Println("✅ Нажимаем OK в диалоге...")
-	page.MustElement(`[id="cjtce8::ok"]`).MustWaitVisible().MustClick()
-
-	log.Println("   -> Ожидание закрытия диалога и обновления страницы (4 сек)...")
-	time.Sleep(4 * time.Second)
-
-	// 7. Выбор типа заявки RFI
-	log.Println("📋 Открываем выпадающий список типов заявок...")
-	dropdownTarget := page.MustElement("#hyj3sh-dropdown-target").MustWaitVisible()
-	dropdownTarget.MustScrollIntoView()
-	time.Sleep(300 * time.Millisecond)
-	dropdownTarget.MustClick()
-
-	log.Println("   -> Ожидание открытия списка (4 сек)...")
-	time.Sleep(4 * time.Second)
-
-	log.Println("🎯 Выбираем 'RFI (строительный контроль)'...")
-	rfiSelected := false
-
-	rfiElement, err := page.ElementX("//html/body/div[5]/div[4]/span")
-	if err == nil && rfiElement != nil {
-		rfiElement.MustClick()
-		rfiSelected = true
-		log.Println("   -> Выбрано через XPath")
-	}
-
-	if !rfiSelected {
-		elements, err := page.ElementsX("//span[contains(text(), 'RFI (строительный контроль)')]")
-		if err == nil && len(elements) > 0 {
-			elements[0].MustClick()
-			rfiSelected = true
-			log.Println("   -> Выбрано через текст")
-		}
-	}
-
-	if !rfiSelected {
-		saveErrorScreenshot(page, "rfi_not_selected")
-		log.Println("⚠️ Не удалось выбрать RFI!")
-	}
-
-	time.Sleep(1 * time.Second)
-
-	// 8. Очистка даты
-	log.Println("📅 Очищаем поле даты...")
-	dateEl := page.MustElement(`[id="C8zl006::content"]`).MustWaitVisible()
-	dateEl.MustScrollIntoView()
-	time.Sleep(300 * time.Millisecond)
-	dateEl.MustClick()
-	time.Sleep(500 * time.Millisecond)
-
-	_, err = page.Eval(`() => {
-		const input = document.querySelector('[id="C8zl006::content"]');
-		if (input) {
-			input.value = ' ';
-			input.dispatchEvent(new Event('change', { bubbles: true }));
-			return 'cleared';
-		}
-		return 'not found';
-	}`)
-	if err != nil {
-		log.Printf("⚠️ Ошибка очистки даты: %v", err)
-	} else {
-		log.Println("   -> Дата очищена")
-	}
-
-	time.Sleep(500 * time.Millisecond)
-
-	// 9. Поиск "SMU"
-	log.Println("🔍 Вводим 'SMU' в поиск...")
-	searchEl := page.MustElement(`[id="l5x27s::content"]`).MustWaitVisible()
-	searchEl.MustScrollIntoView()
-	time.Sleep(300 * time.Millisecond)
-	searchEl.MustClick()
+	// === ЗАПУСК ГЛАВНОГО ОКНА ===
+	go startMainWindow(exeDir, exeName)
 	time.Sleep(300 * time.Millisecond)
 
-	_, err = page.Eval(`() => {
-		const input = document.querySelector('[id="l5x27s::content"]');
-		if (input) {
-			input.value = 'smu';
-			input.dispatchEvent(new Event('change', { bubbles: true }));
-			return 'typed';
-		}
-		return 'not found';
-	}`)
-	if err != nil {
-		log.Printf("⚠️ Ошибка ввода SMU: %v", err)
-	} else {
-		log.Println("   -> SMU введен")
+	// Если конфиг неполный — автоматически открываем настройки
+	if !cfg.IsComplete() {
+		requestOpenSettings()
 	}
 
-	time.Sleep(500 * time.Millisecond)
-
-	log.Println("   -> Нажатие Enter через CDP для поиска...")
-	sendKeyThroughCDP(page, "Enter", proto.InputDispatchKeyEventTypeKeyDown)
-	time.Sleep(100 * time.Millisecond)
-	sendKeyThroughCDP(page, "Enter", proto.InputDispatchKeyEventTypeKeyUp)
-
-	time.Sleep(3 * time.Second)
-
-	// ==========================================
-	// 10. СКАЧИВАНИЕ И ПЕРЕМЕЩЕНИЕ ФАЙЛА
-	// ==========================================
-	log.Println("📥 Начинаем процесс выгрузки в Excel...")
-
-	log.Println("   -> Нажимаем кнопку 'Выгрузка в Excel'...")
-	page.MustElement("#C5xhyht").MustWaitVisible().MustClick()
-
-	log.Printf("   -> Ожидание завершения скачивания в %s (макс. 5 минут)...", downloadDir)
-
-	localFilePath := waitForDownload(downloadDir, "Инспекции на*.xlsx", 5*time.Minute)
-
-	if localFilePath == "" {
-		saveErrorScreenshot(page, "download_timeout")
-		log.Fatalf("❌ Файл не был скачан в течение 5 минут!")
+	// Держим процесс живым, пока работает GUI
+	for atomic.LoadInt32(&guiAlive) == 1 {
+		time.Sleep(200 * time.Millisecond)
 	}
 
-	log.Printf("✅ Файл успешно скачан: %s", localFilePath)
-
-	// ПРОВЕРКА И КОПИРОВАНИЕ В СЕТЕВУЮ ПАПКУ (путь из config.txt)
-	log.Printf("📂 Копирование файла в сетевую папку: %s", networkSharePath)
-
-	if _, err := os.Stat(networkSharePath); os.IsNotExist(err) {
-		saveErrorScreenshot(page, "network_unavailable")
-		log.Fatalf("❌ Сетевая папка недоступна: %v", err)
+	if logFile != nil {
+		logFile.Close()
 	}
-
-	log.Println("🧹 Очистка старых файлов выгрузки в сетевой папке...")
-	cleanOldFiles(networkSharePath, "Инспекции на*.xlsx")
-
-	destFileName := filepath.Base(localFilePath)
-	destFilePath := filepath.Join(networkSharePath, destFileName)
-
-	log.Printf("📋 Копируем %s -> %s", destFileName, networkSharePath)
-	if err := copyFile(localFilePath, destFilePath); err != nil {
-		saveErrorScreenshot(page, "copy_error")
-		log.Fatalf("❌ Ошибка копирования файла в сетевую папку: %v", err)
-	}
-	log.Println("✅ Файл успешно скопирован в сетевую папку!")
-
-	log.Println("🗑️ Удаляем скачанный файл из папки Загрузок...")
-	if err := os.Remove(localFilePath); err != nil {
-		log.Printf("⚠️ Не удалось удалить локальный файл (возможно, он открыт): %v", err)
-	} else {
-		log.Println("✅ Локальная копия удалена")
-	}
-
-	log.Println("🎉 АВТОМАТИЗАЦИЯ ПОЛНОСТЬЮ ЗАВЕРШЕНА!")
-	log.Println("💡 Актуальный файл находится в сетевой папке.")
 }

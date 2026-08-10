@@ -1,3 +1,6 @@
 login=ВАШ_ЛОГИН
 password=ВАШ_ПАРОЛЬ
-network_path=\\server\share\путь\до\папки\Выгрузки\RFI
+rfi_path=\\server\share\папка\Выгрузки_RFI
+id_path=\\server\share\папка\Выгрузки_ИД
+theme=light
+last_tasks=RFI
